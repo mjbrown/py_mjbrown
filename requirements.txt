@@ -1,1 +1,1 @@
-pybluemo==0.15
+pybluemo==0.16
