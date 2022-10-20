@@ -3,11 +3,11 @@ import sys
 from pybluemo import YaspBlueGigaClient, YaspClient
 from pybluemo import MSG_CLASS_BY_RSP_CODE
 
-from pybluemo import MsgError, MsgAccelStream, MsgRtcSync, MsgConnParamUpdate, MsgSoftReset
+from pybluemo import MsgError, MsgAccelStream, MsgRtcSync, MsgConnParamUpdate, MsgSoftReset, MsgAdsAnalogStream
 from pybluemo import MsgDataSinkConfig, MsgDataSinkControl
 from pybluemo import MsgSpiFlashRead, MsgSpiFlashErase, MsgSpiFlashInit
 
-from pybluemo import EnumModify, EnumDataSink, EnumAccelDataRate
+from pybluemo import EnumModify, EnumDataSink, EnumAccelDataRate, EnumAdsDataRate, EnumAdsPga, EnumAdsInputMux
 
 UUT = b"Bluemo v2.0"
 COM = "COM16"
@@ -18,13 +18,14 @@ def rtc_to_int(bvalue):
     return sum([bvalue[i] * (1 << (8 * i)) for i in range(len(bvalue))])
 
 
+# Returns a float value which is the number of seconds since Reset
 def get_rtc(yasp_client):
     resp = yasp_client.send_command(callback=None, msg_defn=MsgRtcSync.builder())
     return rtc_to_int(resp.get_param("RtcCounter")) * 0.0000305
 
 
 def get_flash_info(yasp_client):
-    mem_info = yasp_client.send_command(callback=None, msg_defn=MsgDataSinkConfig.builder(0))
+    mem_info = yasp_client.send_command(callback=None, msg_defn=MsgDataSinkConfig.builder())
     start = mem_info.get_param("StartAddress")
     flash_info = yasp_client.send_command(callback=None, msg_defn=MsgSpiFlashInit.builder())
     block_size = flash_info.get_param("BlockSizeBytes")
@@ -38,11 +39,17 @@ def initiate_collection(yasp_client):
     print(yasp_client.send_command(callback=None, msg_defn=rtc_save))
     accel_save = MsgDataSinkControl.builder(1, MsgAccelStream.get_command_code(), data_sink=EnumDataSink.SPI_FLASH)
     print(yasp_client.send_command(callback=None, msg_defn=accel_save))
+    #ads_save = MsgDataSinkControl.builder(1, MsgAdsAnalogStream.get_command_code(), data_sink=EnumDataSink.SPI_FLASH)
+    #print(yasp_client.send_command(callback=None, msg_defn=ads_save))
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgRtcSync.builder())
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgAccelStream.builder())
+    #yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgAdsAnalogStream.builder(0, EnumAdsPga.FSR0P256, EnumAdsDataRate.CUSTOM_PERIOD, 8))
 
 
 def download_data(yasp_client, filename=default_filename):
+    rtc_save = MsgDataSinkControl.builder(1, MsgRtcSync.get_command_code(), data_sink=EnumDataSink.BLE)
+    print(yasp_client.send_command(callback=None, msg_defn=rtc_save))
+    print("Device Time: %f" % get_rtc(yasp_client))
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgRtcSync.builder())
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgAccelStream.builder(data_rate=EnumAccelDataRate.OFF))
     start, end, block_size, page_size = get_flash_info(yasp_client)
@@ -68,7 +75,8 @@ def erase_all(yasp_client):
             print("Addr: %08X - Data: %s" % (addr, rd))
             print(yasp_client.send_command(callback=None, msg_defn=MsgSpiFlashErase.builder(addr, block_size)))
         else:
-            print(".", end="")
+            break
+            #print(".", end="")
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgSoftReset.builder())
 
 
@@ -80,9 +88,13 @@ def parse_data(filename=default_filename):
         def handle_accel_data(resp):
             print(resp)
 
+        def handle_ads_data(resp):
+            print(resp)
+
         parser = YaspClient(MSG_CLASS_BY_RSP_CODE)
         parser.set_default_msg_callback(MsgRtcSync.get_response_code(), handle_rtc_data)
         parser.set_default_msg_callback(MsgAccelStream.get_response_code(), handle_accel_data)
+        parser.set_default_msg_callback(MsgAdsAnalogStream.get_response_code(), handle_ads_data)
         progress = 0
         data = fp.read(512)
         while len(data) > 0:
@@ -91,6 +103,10 @@ def parse_data(filename=default_filename):
             parser.serial_rx(data)
             data = fp.read(512)
             time.sleep(1)
+
+
+def check_progress(yasp_client):
+    print(yasp_client.send_command(callback=None, msg_defn=MsgDataSinkConfig.builder()))
 
 
 def main():
@@ -122,6 +138,8 @@ def main():
             download_data(yasp_client, sys.argv[2])
         else:
             download_data(yasp_client)
+    elif "--check" in sys.argv:
+        check_progress(yasp_client)
     time.sleep(1)
     client.disconnect(conn_handle)
 
