@@ -1,3 +1,4 @@
+import struct
 import time
 import sys
 from pybluemo import YaspBlueGigaClient, YaspClient
@@ -11,7 +12,8 @@ from pybluemo import EnumModify, EnumDataSink, EnumAccelDataRate, EnumAdsDataRat
 
 UUT = b"Bluemo v2.0"
 COM = "COM16"
-default_filename = "nvm_data.dat"
+nvm_filename = "nvm_data.dat"
+parsed_filename = "parsed_data.csv"
 
 
 def rtc_to_int(bvalue):
@@ -37,21 +39,23 @@ def get_flash_info(yasp_client):
 def initiate_collection(yasp_client):
     rtc_save = MsgDataSinkControl.builder(1, MsgRtcSync.get_command_code(), data_sink=EnumDataSink.SPI_FLASH)
     print(yasp_client.send_command(callback=None, msg_defn=rtc_save))
-    accel_save = MsgDataSinkControl.builder(1, MsgAccelStream.get_command_code(), data_sink=EnumDataSink.SPI_FLASH)
-    print(yasp_client.send_command(callback=None, msg_defn=accel_save))
-    #ads_save = MsgDataSinkControl.builder(1, MsgAdsAnalogStream.get_command_code(), data_sink=EnumDataSink.SPI_FLASH)
-    #print(yasp_client.send_command(callback=None, msg_defn=ads_save))
+    ads_save = MsgDataSinkControl.builder(1, MsgAdsAnalogStream.get_command_code(), data_sink=EnumDataSink.SPI_FLASH)
+    print(yasp_client.send_command(callback=None, msg_defn=ads_save))
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgRtcSync.builder())
-    yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgAccelStream.builder())
-    #yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgAdsAnalogStream.builder(0, EnumAdsPga.FSR0P256, EnumAdsDataRate.CUSTOM_PERIOD, 8))
+    yasp_client.send_command(callback=lambda rsp: print(rsp),
+                             msg_defn=MsgAdsAnalogStream.builder(instance=0,
+                                                                 data_range=EnumAdsPga.FSR0P256,
+                                                                 data_rate=EnumAdsDataRate.CUSTOM_PERIOD,
+                                                                 custom_period=10, watermark=16))
 
 
-def download_data(yasp_client, filename=default_filename):
+def download_data(yasp_client, filename=nvm_filename):
     rtc_save = MsgDataSinkControl.builder(1, MsgRtcSync.get_command_code(), data_sink=EnumDataSink.BLE)
     print(yasp_client.send_command(callback=None, msg_defn=rtc_save))
     print("Device Time: %f" % get_rtc(yasp_client))
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgRtcSync.builder())
-    yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgAccelStream.builder(data_rate=EnumAccelDataRate.OFF))
+    yasp_client.send_command(callback=lambda rsp: print(rsp),
+                             msg_defn=MsgAdsAnalogStream.builder(data_rate=EnumAdsDataRate.SINGLE_SAMPLE))
     start, end, block_size, page_size = get_flash_info(yasp_client)
     with open(filename, "wb") as fp:
         pages = (end - start) // page_size
@@ -80,21 +84,41 @@ def erase_all(yasp_client):
     yasp_client.send_command(callback=lambda rsp: print(rsp), msg_defn=MsgSoftReset.builder())
 
 
-def parse_data(filename=default_filename):
+class DatParser(object):
+    def __init__(self, out_filename=parsed_filename):
+        self.out_fp = open(out_filename, "w")
+        self.running_counter = 0
+        self.rtc_value = 0
+
+    def handle_rtc_data(self, resp):
+        b = resp.get_param("RtcCounter")
+        filler = b"\x00" * (8 - len(b))
+        counter = b + filler
+        self.rtc_value = struct.unpack("<Q", counter)[0]
+
+    def handle_accel_data(self, resp):
+        self.out_fp.write(str(resp))
+
+    def handle_ads_data(self, resp):
+        adc_data = resp.get_param("AdcData")
+        sample_count = resp.get_param("Watermark")
+        values = struct.unpack("<%dh" % sample_count, adc_data)
+        for value in values:
+            self.out_fp.write("\n%d,%d" % (self.running_counter, value))
+            if self.rtc_value > 0:
+                self.out_fp.write(",%d" % self.rtc_value)
+                self.rtc_value = 0
+            self.running_counter += 1
+        #self.out_fp.write(str(values))
+
+
+def parse_data(filename=nvm_filename, out_filename=parsed_filename):
+    dat_parser = DatParser(out_filename)
     with open(filename, "rb") as fp:
-        def handle_rtc_data(resp):
-            print(resp)
-
-        def handle_accel_data(resp):
-            print(resp)
-
-        def handle_ads_data(resp):
-            print(resp)
-
         parser = YaspClient(MSG_CLASS_BY_RSP_CODE)
-        parser.set_default_msg_callback(MsgRtcSync.get_response_code(), handle_rtc_data)
-        parser.set_default_msg_callback(MsgAccelStream.get_response_code(), handle_accel_data)
-        parser.set_default_msg_callback(MsgAdsAnalogStream.get_response_code(), handle_ads_data)
+        parser.set_default_msg_callback(MsgRtcSync.get_response_code(), lambda resp: dat_parser.handle_rtc_data(resp))
+        parser.set_default_msg_callback(MsgAccelStream.get_response_code(), lambda resp: dat_parser.handle_accel_data(resp))
+        parser.set_default_msg_callback(MsgAdsAnalogStream.get_response_code(), lambda resp: dat_parser.handle_ads_data(resp))
         progress = 0
         data = fp.read(512)
         while len(data) > 0:
@@ -102,7 +126,7 @@ def parse_data(filename=default_filename):
             progress += len(data)
             parser.serial_rx(data)
             data = fp.read(512)
-            time.sleep(1)
+            #time.sleep(1)
 
 
 def check_progress(yasp_client):
@@ -116,7 +140,7 @@ def main():
             print("Parsing %s..." % sys.argv[2])
             parse_data(sys.argv[2])
         else:
-            print("Parsing %s..." % default_filename)
+            print("Parsing %s..." % nvm_filename)
             parse_data()
         return
     client = YaspBlueGigaClient(port=COM)
